@@ -1446,13 +1446,13 @@ struct StandardClient : public MegaApp
         }
     }
 
-    bool setupSync_inthread(int syncTag, const string& subfoldername, const fs::path& localpath)
+    bool setupSync_inthread(int syncTag, const string& subfoldername, const fs::path& localpath, bool isBackup)
     {
         if (Node* n = client.nodebyhandle(basefolderhandle))
         {
             if (Node* m = drillchildnodebyname(n, subfoldername))
             {
-                SyncConfig syncConfig{syncTag, localpath.u8string(), localpath.u8string(), m->nodehandle, subfoldername, 0};
+                SyncConfig syncConfig{syncTag, localpath.u8string(), localpath.u8string(), m->nodehandle, subfoldername, 0,  {}, true, isBackup ? SyncConfig::TYPE_BACKUP : SyncConfig::TYPE_TWOWAY};
                 SyncError syncError;
                 error e = client.addsync(std::move(syncConfig), DEBRISFOLDER, NULL, syncError);  // use syncid as tag
                 if (!e)
@@ -2072,11 +2072,11 @@ struct StandardClient : public MegaApp
     //    return setupSync_mainthread(localsyncrootfolder, remotesyncrootfolder, syncid);
     //}
 
-    bool setupSync_mainthread(const std::string& localsyncrootfolder, const std::string& remotesyncrootfolder, int syncTag)
+    bool setupSync_mainthread(const std::string& localsyncrootfolder, const std::string& remotesyncrootfolder, int syncTag, bool isBackup = false)
     {
         fs::path syncdir = fsBasePath / fs::u8path(localsyncrootfolder);
         fs::create_directory(syncdir);
-        future<bool> fb = thread_do([=](StandardClient& mc, promise<bool>& pb) { pb.set_value(mc.setupSync_inthread(syncTag, remotesyncrootfolder, syncdir)); });
+        future<bool> fb = thread_do([=](StandardClient& mc, promise<bool>& pb) { pb.set_value(mc.setupSync_inthread(syncTag, remotesyncrootfolder, syncdir, isBackup)); });
         return fb.get();
     }
 
@@ -4519,6 +4519,8 @@ TEST(BackupOnly, RemoteRenameCancelsSync)
 
 struct TwoWaySyncSymmetryCase
 {
+    enum SyncType { type_twoWay, type_backupSync, type_numTypes };
+
     enum Action { action_rename, action_moveWithinSync, action_moveOutOfSync, action_moveIntoSync, action_delete, action_numactions };
 
     enum MatchState { match_exact,      // the sync destination has the exact same file/folder at the same relative path
@@ -4526,10 +4528,11 @@ struct TwoWaySyncSymmetryCase
                       match_newer,      // the sync destination has a newer file/folder at the same relative path
                       match_absent };   // the sync destination has no node at the same relative path
 
+    SyncType syncType = type_twoWay;
     Action action = action_rename;
-    bool selfChange = false; // changed by our own client or another
-    bool up = false;  // or down - sync direction
-    bool file = false;  // or folder.  Which one this test changes
+    bool selfChange = false;     // changed by our own client or another
+    bool localChange = false;    // change a local node or a remote one
+    bool file = false;           // or folder.  Which one this test changes
     bool pauseDuringAction = false;
     int sync_tag = -1;
     Model localModel;
@@ -4555,7 +4558,15 @@ struct TwoWaySyncSymmetryCase
     State& state;
     TwoWaySyncSymmetryCase(State& wholestate) : state(wholestate) {}
 
-    // todo: remote changes made by client (of this sync) or other client
+    std::string typeName()
+    {
+        switch (syncType)
+        {
+        case type_twoWay: return "twoWay_";
+        case type_backupSync: return "backup_";
+        default: assert(false); return "";
+        }
+    }
 
     std::string actionName()
     {
@@ -4584,9 +4595,9 @@ struct TwoWaySyncSymmetryCase
 
     std::string name()
     {
-        return  actionName() +
-                (up?"_up" : "_down") +
-                (selfChange?"_self":"_other") +
+        return  typeName() + actionName() +
+                (localChange ?"_localChange" : "_remoteChange") +
+                (selfChange?"_bySelf":"_byOther") +
                 (file?"_file":"_folder") +
                 (pauseDuringAction?"_resumed":"");
     }
@@ -4595,8 +4606,8 @@ struct TwoWaySyncSymmetryCase
     fs::path localTestBasePathResume;
     std::string remoteTestBasePath;
 
-    Model& sourceModel() { return up ? localModel : remoteModel; }
-    Model& destinationModel() { return up ? remoteModel : localModel; }
+    Model& sourceModel() { return localChange ? localModel : remoteModel; }
+    Model& destinationModel() { return localChange ? remoteModel : localModel; }
 
     StandardClient& client1() { return pauseDuringAction ? state.resumeClient : state.steadyClient; }
     StandardClient& changeClient() { return selfChange ? client1() : state.nonsyncClient; }
@@ -4700,13 +4711,13 @@ struct TwoWaySyncSymmetryCase
 
         if (!inthread)
         {
-            bool syncsetup = client1().setupSync_mainthread(lsfr, rsfr, sync_tag = ++state.next_sync_tag);
+            bool syncsetup = client1().setupSync_mainthread(lsfr, rsfr, sync_tag = ++state.next_sync_tag, syncType == TwoWaySyncSymmetryCase::type_backupSync);
             ASSERT_TRUE(syncsetup);
         }
         else
         {
             fs::path syncdir = client1().fsBasePath / fs::u8path(lsfr);
-            client1().setupSync_inthread(++state.next_sync_tag, rsfr, syncdir);
+            client1().setupSync_inthread(++state.next_sync_tag, rsfr, syncdir, syncType == TwoWaySyncSymmetryCase::type_backupSync);
         }
     }
 
@@ -4941,55 +4952,55 @@ struct TwoWaySyncSymmetryCase
 
     void source_rename(std::string nodepath, std::string newname, bool updatemodel, bool reportaction, bool deleteTargetFirst)
     {
-        if (up) local_rename(nodepath, newname, updatemodel, reportaction, deleteTargetFirst);
+        if (localChange) local_rename(nodepath, newname, updatemodel, reportaction, deleteTargetFirst);
         else remote_rename(nodepath, newname, updatemodel, reportaction, deleteTargetFirst);
     }
 
     void source_move(std::string nodepath, std::string newparentpath, bool updatemodel, bool reportaction, bool deleteTargetFirst)
     {
-        if (up) local_move(nodepath, newparentpath, updatemodel, reportaction, deleteTargetFirst);
+        if (localChange) local_move(nodepath, newparentpath, updatemodel, reportaction, deleteTargetFirst);
         else remote_move(nodepath, newparentpath, updatemodel, reportaction, deleteTargetFirst);
     }
 
     void source_copy(std::string nodepath, std::string newparentpath, bool updatemodel, bool reportaction)
     {
-        if (up) local_copy(nodepath, newparentpath, updatemodel, reportaction);
+        if (localChange) local_copy(nodepath, newparentpath, updatemodel, reportaction);
         else remote_copy(nodepath, newparentpath, updatemodel, reportaction);
     }
 
     void source_delete(std::string nodepath, bool updatemodel, bool reportaction = false)
     {
-        if (up) local_delete(nodepath, updatemodel, reportaction, false);
+        if (localChange) local_delete(nodepath, updatemodel, reportaction, false);
         else remote_delete(nodepath, updatemodel, reportaction, false);
     }
 
     void destination_rename(std::string nodepath, std::string newname, bool updatemodel, bool reportaction, bool deleteTargetFirst)
     {
-        if (!up) local_rename(nodepath, newname, updatemodel, reportaction, deleteTargetFirst);
+        if (!localChange) local_rename(nodepath, newname, updatemodel, reportaction, deleteTargetFirst);
         else remote_rename(nodepath, newname, updatemodel, reportaction, deleteTargetFirst);
     }
 
     void destination_move(std::string nodepath, std::string newparentpath, bool updatemodel, bool reportaction, bool deleteTargetFirst)
     {
-        if (!up) local_move(nodepath, newparentpath, updatemodel, reportaction, deleteTargetFirst);
+        if (!localChange) local_move(nodepath, newparentpath, updatemodel, reportaction, deleteTargetFirst);
         else remote_move(nodepath, newparentpath, updatemodel, reportaction, deleteTargetFirst);
     }
 
     void destination_copy(std::string nodepath, std::string newparentpath, bool updatemodel, bool reportaction)
     {
-        if (!up) local_copy(nodepath, newparentpath, updatemodel, reportaction);
+        if (!localChange) local_copy(nodepath, newparentpath, updatemodel, reportaction);
         else remote_copy(nodepath, newparentpath, updatemodel, reportaction);
     }
 
     void destination_delete(std::string nodepath, bool updatemodel, bool reportaction)
     {
-        if (!up) local_delete(nodepath, updatemodel, reportaction, false);
+        if (!localChange) local_delete(nodepath, updatemodel, reportaction, false);
         else remote_delete(nodepath, updatemodel, reportaction, false);
     }
 
     void destination_copy_renamed(std::string sourcefolder, std::string oldname, std::string newname, std::string targetfolder, bool updatemodel, bool reportaction, bool deleteTargetFirst)
     {
-        if (up)
+        if (localChange)
         {
             remote_renamed_copy(sourcefolder + "/" + oldname, targetfolder, newname, updatemodel, reportaction);
             return;
@@ -5003,7 +5014,7 @@ struct TwoWaySyncSymmetryCase
 
     void destination_rename_move(std::string sourcefolder, std::string oldname, std::string newname, std::string targetfolder, bool updatemodel, bool reportaction, bool deleteTargetFirst, std::string deleteNameInTargetFirst)
     {
-        if (up)
+        if (localChange)
         {
             remote_renamed_move(sourcefolder + "/" + oldname, targetfolder, newname, updatemodel, reportaction);
             return;
@@ -5061,6 +5072,11 @@ struct TwoWaySyncSymmetryCase
         }
     }
 
+    bool backupDisallowed()
+    {
+        return !localChange && syncType == TwoWaySyncSymmetryCase::type_backupSync;
+    }
+
     void Modify(ModifyStage stage)
     {
         bool prep = stage == Prepare;
@@ -5092,12 +5108,12 @@ struct TwoWaySyncSymmetryCase
                 if (file)
                 {
                     source_rename("f/f_0/file0_f_0", "file0_f_0_renamed", true, true, true);
-                    destinationModel().emulate_rename("f/f_0/file0_f_0", "file0_f_0_renamed");
+                    if (!backupDisallowed()) destinationModel().emulate_rename("f/f_0/file0_f_0", "file0_f_0_renamed");
                 }
                 else
                 {
                     source_rename("f/f_0", "f_0_renamed", true, true, false);
-                    destinationModel().emulate_rename("f/f_0", "f_0_renamed");
+                    if (!backupDisallowed()) destinationModel().emulate_rename("f/f_0", "f_0_renamed");
                 }
             }
             break;
@@ -5111,12 +5127,12 @@ struct TwoWaySyncSymmetryCase
                 if (file)
                 {
                     source_move("f/f_1/file0_f_1", "f/f_0", true, true, false);
-                    destinationModel().emulate_move("f/f_1/file0_f_1", "f/f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_move("f/f_1/file0_f_1", "f/f_0");
                 }
                 else
                 {
                     source_move("f/f_1", "f/f_0", true, true, false);
-                    destinationModel().emulate_move("f/f_1", "f/f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_move("f/f_1", "f/f_0");
                 }
             }
             break;
@@ -5130,12 +5146,12 @@ struct TwoWaySyncSymmetryCase
                 if (file)
                 {
                     source_move("f/f_0/file0_f_0", "outside", true, false, false);
-                    destinationModel().emulate_delete("f/f_0/file0_f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_delete("f/f_0/file0_f_0");
                 }
                 else
                 {
                     source_move("f/f_0", "outside", true, false, false);
-                    destinationModel().emulate_delete("f/f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_delete("f/f_0");
                 }
             }
             break;
@@ -5149,13 +5165,13 @@ struct TwoWaySyncSymmetryCase
                 if (file)
                 {
                     source_move("outside/file0_outside", "f/f_0", true, false, false);
-                    destinationModel().emulate_copy("outside/file0_outside", "f/f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_copy("outside/file0_outside", "f/f_0");
                 }
                 else
                 {
                     source_move("outside", "f/f_0", true, false, false);
-                    destinationModel().emulate_delete("f/f_0/outside");
-                    destinationModel().emulate_copy("outside", "f/f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_delete("f/f_0/outside");
+                    if (!backupDisallowed()) destinationModel().emulate_copy("outside", "f/f_0");
                 }
             }
             break;
@@ -5169,12 +5185,12 @@ struct TwoWaySyncSymmetryCase
                 if (file)
                 {
                     source_delete("f/f_0/file0_f_0", true, true);
-                    destinationModel().emulate_delete("f/f_0/file0_f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_delete("f/f_0/file0_f_0");
                 }
                 else
                 {
                     source_delete("f/f_0", true, true);
-                    destinationModel().emulate_delete("f/f_0");
+                    if (!backupDisallowed()) destinationModel().emulate_delete("f/f_0");
                 }
             }
             break;
@@ -5234,7 +5250,22 @@ struct TwoWaySyncSymmetryCase
         EXPECT_EQ(localfs, localnode);
         EXPECT_EQ(localnode, remote);
         EXPECT_TRUE(localfs && localnode && remote) << " failed in " << name();
-        finalResult = localfs && localnode && remote;
+
+        bool stateCorrect = false;
+        Sync* sync = client1().syncByTag(sync_tag);
+        if (backupDisallowed() /*&& !pauseDuringAction*/)
+        {
+            EXPECT_EQ(sync, (Sync*)nullptr);
+            stateCorrect = sync == nullptr;
+        }
+        else
+        {
+            EXPECT_NE(sync, (Sync*)nullptr);
+            EXPECT_TRUE(sync && sync->state == SYNC_ACTIVE);
+            stateCorrect = sync && sync->state == SYNC_ACTIVE;
+        }
+
+        finalResult = localfs && localnode && remote && stateCorrect;
     }
 };
 
@@ -5274,40 +5305,47 @@ TEST(Sync, TwoWay_Highlevel_Symmetries)
 
     static string singleNamedTest = ""; // to investigate just one sync case, put its name here, otherwise we loop.
 
-    for (int selfChange = 0; selfChange < 2; ++selfChange)
+    
+    for (int syncType = TwoWaySyncSymmetryCase::type_numTypes; --syncType; )
     {
-        //if (!selfChange) continue;
+        //if (syncType != TwoWaySyncSymmetryCase::type_backupSync) continue;
 
-        for (int up = 0; up < 2; ++up)
+        for (int selfChange = 0; selfChange < 2; ++selfChange)
         {
-            //if (!up) continue;
+            //if (!selfChange) continue;
 
-            for (int action = 0; action < (int)TwoWaySyncSymmetryCase::action_numactions; ++action)
+            for (int localChange = 0; localChange < 2; ++localChange)
             {
-                //if (action != TwoWaySyncSymmetryCase::action_rename) continue;
+                //if (!localChange) continue;
 
-                for (int file = 1; file < 2; ++file)
+                for (int action = 0; action < (int)TwoWaySyncSymmetryCase::action_numactions; ++action)
                 {
-                    //if (!file) continue;
+                    //if (action != TwoWaySyncSymmetryCase::action_rename) continue;
 
-                    for (int pauseDuringAction = 0; pauseDuringAction < 2; ++pauseDuringAction)
+                    for (int file = 1; file < 2; ++file)
                     {
-                        //if (pauseDuringAction) continue;
+                        //if (!file) continue;
 
-                        // we can't make changes if the client is not running
-                        if (pauseDuringAction && selfChange) continue;
-
-                        TwoWaySyncSymmetryCase testcase(allstate);
-                        testcase.selfChange = selfChange != 0;
-                        testcase.up = up;
-                        testcase.action = TwoWaySyncSymmetryCase::Action(action);
-                        testcase.file = file;
-                        testcase.pauseDuringAction = pauseDuringAction;
-                        testcase.printTreesBeforeAndAfter = !singleNamedTest.empty();
-
-                        if (singleNamedTest.empty() || testcase.name() == singleNamedTest)
+                        for (int pauseDuringAction = 0; pauseDuringAction < 2; ++pauseDuringAction)
                         {
-                            cases.emplace(testcase.name(), move(testcase));
+                            //if (pauseDuringAction) continue;
+
+                            // we can't make changes if the client is not running
+                            if (pauseDuringAction && selfChange) continue;
+
+                            TwoWaySyncSymmetryCase testcase(allstate);
+                            testcase.syncType = TwoWaySyncSymmetryCase::SyncType(syncType);
+                            testcase.selfChange = selfChange != 0;
+                            testcase.localChange = localChange;
+                            testcase.action = TwoWaySyncSymmetryCase::Action(action);
+                            testcase.file = file;
+                            testcase.pauseDuringAction = pauseDuringAction;
+                            testcase.printTreesBeforeAndAfter = !singleNamedTest.empty();
+
+                            if (singleNamedTest.empty() || testcase.name() == singleNamedTest)
+                            {
+                                cases.emplace(testcase.name(), move(testcase));
+                            }
                         }
                     }
                 }
@@ -5315,8 +5353,7 @@ TEST(Sync, TwoWay_Highlevel_Symmetries)
         }
     }
 
-
-    out() << "Creating initial local files/folders for " << cases.size() << " Two-way sync test cases" << endl;
+    out() << "Creating initial local files/folders for " << cases.size() << " sync test cases" << endl;
     for (auto& testcase : cases)
     {
         testcase.second.SetupForSync();
