@@ -16903,10 +16903,7 @@ void MegaApiImpl::eraseSync(int tag)
     if (it != syncMap.end())
     {
         sync.reset(it->second);
-        if (client->syncConfigs)
-        {
-            client->syncConfigs->removeByTag(sync->getTag());
-        }
+        client->removeSyncConfig(sync->getTag(), false);
         syncMap.erase(it);
         fireonSyncDeleted(sync.get());
     }
@@ -21744,14 +21741,7 @@ void MegaApiImpl::sendPendingRequests()
                 syncConfig.setError(syncError);
             }
 
-            if (client->syncConfigs)
-            {
-                client->syncConfigs->insert(syncConfig);
-            }
-            else
-            {
-                e = API_ENOENT;
-            }
+            e = client->updateSyncConfig(syncConfig);
 
             if (!e)
             {
